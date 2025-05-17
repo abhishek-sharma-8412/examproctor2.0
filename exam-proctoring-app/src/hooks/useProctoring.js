@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { proctoringService } from '../services/api';
+import * as faceapi from 'face-api.js';
 
 export const useProctoring = (sessionId) => {
   const [isFullScreen, setIsFullScreen] = useState(false);
@@ -9,17 +10,32 @@ export const useProctoring = (sessionId) => {
   const [multipleFaces, setMultipleFaces] = useState(false);
   const [eyeMovement, setEyeMovement] = useState('normal');
   const [faceVerified, setFaceVerified] = useState(false);
-  
+
   const webcamRef = useRef(null);
   const streamRef = useRef(null);
   const faceCheckIntervalRef = useRef(null);
-  
+  const faceApiLoadedRef = useRef(false);
+
   // Join exam session for real-time updates
   useEffect(() => {
     if (sessionId) {
       proctoringService.joinExamSession(sessionId);
     }
   }, [sessionId]);
+
+  // Load face-api.js models once
+  useEffect(() => {
+    const loadModels = async () => {
+      try {
+        await faceapi.nets.tinyFaceDetector.loadFromUri('/models');
+        faceApiLoadedRef.current = true;
+      } catch (err) {
+        console.error('Error loading face-api.js models:', err);
+        addWarning('Face detection models failed to load');
+      }
+    };
+    loadModels();
+  }, []);
 
   // Request full screen
   const requestFullScreen = () => {
@@ -51,31 +67,26 @@ export const useProctoring = (sessionId) => {
   // Start webcam
   const startWebcam = async () => {
     try {
-      // First check if we already have a stream
       if (streamRef.current) {
         if (webcamRef.current) {
           webcamRef.current.srcObject = streamRef.current;
         }
         return true;
       }
-      
-      // Explicitly request the laptop's camera
-      const stream = await navigator.mediaDevices.getUserMedia({ 
-        video: { 
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
           facingMode: "user",
           width: { ideal: 640 },
           height: { ideal: 480 }
         },
         audio: false
       });
-      
       if (webcamRef.current) {
         webcamRef.current.srcObject = stream;
         webcamRef.current.onloadedmetadata = () => {
           webcamRef.current.play().catch(e => console.error("Error playing video:", e));
         };
       }
-      
       streamRef.current = stream;
       console.log("Webcam started successfully");
       return true;
@@ -91,7 +102,6 @@ export const useProctoring = (sessionId) => {
     if (faceCheckIntervalRef.current) {
       clearInterval(faceCheckIntervalRef.current);
     }
-    
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(track => track.stop());
       streamRef.current = null;
@@ -101,14 +111,11 @@ export const useProctoring = (sessionId) => {
   // Take screenshot
   const takeScreenshot = async () => {
     if (!webcamRef.current || !webcamRef.current.videoWidth) return null;
-    
     const canvas = document.createElement('canvas');
     canvas.width = webcamRef.current.videoWidth;
     canvas.height = webcamRef.current.videoHeight;
-    
     const ctx = canvas.getContext('2d');
     ctx.drawImage(webcamRef.current, 0, 0, canvas.width, canvas.height);
-    
     return new Promise((resolve) => {
       canvas.toBlob(resolve, 'image/jpeg', 0.8);
     });
@@ -117,11 +124,9 @@ export const useProctoring = (sessionId) => {
   // Register face for proctoring
   const registerFace = async () => {
     if (!sessionId) return null;
-    
     try {
       const screenshot = await takeScreenshot();
       if (!screenshot) return null;
-      
       const result = await proctoringService.registerFace(sessionId, screenshot);
       setFaceVerified(true);
       return result;
@@ -130,53 +135,79 @@ export const useProctoring = (sessionId) => {
       return null;
     }
   };
-// src/hooks/useProctoring.js (partial update)
 
-// Update the startFaceVerification function
-const startFaceVerification = () => {
-  if (faceCheckIntervalRef.current) {
-    clearInterval(faceCheckIntervalRef.current);
-  }
-  
-  // Check face every 5 seconds (more frequent checks)
-  faceCheckIntervalRef.current = setInterval(async () => {
-    try {
-      const screenshot = await takeScreenshot();
-      if (!screenshot) return;
-      
-      const result = await proctoringService.verifyFace(sessionId, screenshot);
-      
-      // Update states based on verification result with more accurate detection
-      setFaceDetected(result.faceDetected);
-      setMultipleFaces(result.multipleFaces);
-      
-      // Handle suspicious eye movement with more details
-      if (result.suspiciousEyeMovement) {
-        setEyeMovement('suspicious');
-        const reason = result.eyeMovementDetails?.reason || 'Suspicious eye movement';
-        addWarning(reason);
-      } else {
-        setEyeMovement('normal');
+  // Real-time face detection using face-api.js
+  useEffect(() => {
+    let animationFrameId;
+    const detectFaces = async () => {
+      if (
+        webcamRef.current &&
+        webcamRef.current.readyState === 4 &&
+        faceApiLoadedRef.current
+      ) {
+        try {
+          const detections = await faceapi.detectAllFaces(
+            webcamRef.current,
+            new faceapi.TinyFaceDetectorOptions()
+          );
+          setFaceDetected(detections.length === 1);
+          setMultipleFaces(detections.length > 1);
+
+          // Optionally, add warnings (debounced)
+          if (detections.length === 0) {
+            addWarning("Face not detected. Please ensure your face is visible.");
+          } else if (detections.length > 1) {
+            addWarning("Multiple faces detected. Only the exam taker should be visible.");
+          }
+        } catch (err) {
+          console.error('Face detection error:', err);
+        }
       }
-      
-      // Handle face detection issues
-      if (!result.faceDetected) {
-        addWarning("Face not detected - please look at the camera");
-      } else if (result.multipleFaces) {
-        addWarning(`Multiple faces detected (${result.faceCount})`);
-      } else if (!result.faceMatched && result.similarity < 0.5) {
-        addWarning("Face doesn't match registered face - possible impersonation");
-      }
-    } catch (error) {
-      console.error('Face verification error:', error);
+      animationFrameId = requestAnimationFrame(detectFaces);
+    };
+
+    detectFaces();
+    return () => {
+      if (animationFrameId) cancelAnimationFrame(animationFrameId);
+    };
+    // eslint-disable-next-line
+  }, [webcamRef, faceApiLoadedRef]);
+
+  // Face verification with backend (existing logic)
+  const startFaceVerification = () => {
+    if (faceCheckIntervalRef.current) {
+      clearInterval(faceCheckIntervalRef.current);
     }
-  }, 5000); // Check every 5 seconds for better responsiveness
-};
+    faceCheckIntervalRef.current = setInterval(async () => {
+      try {
+        const screenshot = await takeScreenshot();
+        if (!screenshot) return;
+        const result = await proctoringService.verifyFace(sessionId, screenshot);
+        setFaceDetected(result.faceDetected);
+        setMultipleFaces(result.multipleFaces);
+        if (result.suspiciousEyeMovement) {
+          setEyeMovement('suspicious');
+          const reason = result.eyeMovementDetails?.reason || 'Suspicious eye movement';
+          addWarning(reason);
+        } else {
+          setEyeMovement('normal');
+        }
+        if (!result.faceDetected) {
+          addWarning("Face not detected - please look at the camera");
+        } else if (result.multipleFaces) {
+          addWarning(`Multiple faces detected (${result.faceCount})`);
+        } else if (!result.faceMatched && result.similarity < 0.5) {
+          addWarning("Face doesn't match registered face - possible impersonation");
+        }
+      } catch (error) {
+        console.error('Face verification error:', error);
+      }
+    }, 5000);
+  };
 
   // Log proctoring event
   const logProctoringEvent = async (eventType, details = {}) => {
     if (!sessionId) return;
-    
     try {
       const screenshot = await takeScreenshot();
       await proctoringService.logEvent(sessionId, eventType, details, screenshot);
@@ -204,9 +235,7 @@ const startFaceVerification = () => {
         document.webkitFullscreenElement ||
         document.msFullscreenElement
       );
-      
       setIsFullScreen(isInFullScreen);
-      
       if (!isInFullScreen && sessionId) {
         logProctoringEvent('full_screen_exit');
         addWarning("Full screen mode exited");
